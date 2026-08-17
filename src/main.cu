@@ -35,8 +35,8 @@ int main(void){
     thrust::device_vector<double> r(N);
     thrust::device_vector<double> r_hat(N);
 
-    thrust::device_vector<double> v(N); thrust::fill(thrust::device, v.begin(), v.end(), 0.0f);
-    thrust::device_vector<double> p(N); thrust::fill(thrust::device, p.begin(), p.end(), 0.0f);
+    thrust::device_vector<double> v(N); 
+    thrust::device_vector<double> p(N); 
     
     thrust::device_vector<double> s(N);
     thrust::device_vector<double> t(N);
@@ -80,6 +80,7 @@ int main(void){
         for (int i = 0; i < 7; i++){
             temp += ptr_A[a * 7 + i] * ptr_p[a+i];
         }
+        return temp;
     };
 
     auto s_calc = [=] __device__ (int a){
@@ -125,7 +126,7 @@ int main(void){
         omega = thrust::inner_product(thrust::device, s.begin(), s.end(), t.begin(), 0.0f)/thrust::inner_product(thrust::device, t.begin(), t.end(), t.begin(), 1.0f);
 
         thrust::transform(thrust::device, first, last, x.begin(), x_calc);
-        thrust::transform(thrust::device, first, last, r.begin(), r_calc);
+        thrust::transform(thrust::device, first, last, r.begin(), r_calc_update);
     }
     return 0;
 }

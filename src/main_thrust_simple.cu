@@ -32,7 +32,7 @@ int main(void){
 
     // Initial values on host to simulate real world environment
     thrust::default_random_engine rng(time(NULL));
-    thrust::uniform_real_distribution<double> dist(-50.0, 50.0);
+    thrust::uniform_real_distribution<double> dist(-1.0, 1.0);
 
     thrust::host_vector<double> h_A(N*7);
     thrust::host_vector<double> h_b(N);
@@ -137,9 +137,8 @@ int main(void){
 
     // loop
     std::cout << thrust::inner_product(thrust::device, r.begin(), r.end(), r.begin(), 0.0f) << std::endl;
-    while (
-        thrust::inner_product(thrust::device, r.begin(), r.end(), r.begin(), 0.0f) > ERROR_RATE
-    ){
+    
+    for (int i = 0; i < 50; i++) {
         rho_p = rho;
         rho = thrust::inner_product(thrust::device, r.begin(), r.end(), r_hat.begin(), 0.0f); 
         beta = (rho / rho_p) * (alpha / omega);

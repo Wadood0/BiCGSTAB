@@ -528,5 +528,24 @@ int main(int argc, char** argv){
     PROF_PUSH("final:residual_norm");
     std::cout << "residual: " << thrust::inner_product(thrust::device, r.begin(), r.end(), r.begin(), 0.0) << std::endl;
     PROF_POP_SYNC(); // final:residual_norm
+
+    // The device_vectors (A, b, x, r, r_hat, v, p, s, t) release themselves
+    // when they go out of scope; the raw cudaMalloc'd scalars do not.
+    PROF_PUSH("teardown:device_free");
+    CUDA_CHECK(cudaFree(d_rho));
+    CUDA_CHECK(cudaFree(d_rho_p));
+    CUDA_CHECK(cudaFree(d_alpha));
+    CUDA_CHECK(cudaFree(d_omega));
+    CUDA_CHECK(cudaFree(d_beta));
+
+    CUDA_CHECK(cudaFree(rho_alpha));
+    CUDA_CHECK(cudaFree(rho_p_omega));
+    CUDA_CHECK(cudaFree(r_hat_v));
+    CUDA_CHECK(cudaFree(sTt));
+    CUDA_CHECK(cudaFree(tTt));
+
+    CUDA_CHECK(cudaFree(d_temp_storage));
+    PROF_POP_SYNC(); // teardown:device_free
+
     return 0;
 }

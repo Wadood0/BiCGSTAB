@@ -11,10 +11,23 @@
 #include <thrust/random.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <chrono>
 #include <nvtx3/nvToolsExt.h>
 #include <iostream>
 #include <cub/cub.cuh>
 #include <cuda/std/functional>
+
+// ---- per-step syncs ----
+// Inside the solve loop every profiling range, and every kernel check, waits for the GPU, so
+// the NVTX step ranges time the GPU work - at the cost of a host round trip
+// per step. Build with -DPROFILE_SYNC=0 (make PROFILE_SYNC=0, or the *_nosync
+// targets) to drop those syncs inside the loop: the step ranges then time
+// only the launches, and launch errors are still checked. Setup and teardown always sync, and the loop
+// timer syncs at both ends itself.
+#ifndef PROFILE_SYNC
+#define PROFILE_SYNC 1
+#endif
+static bool step_syncs = true;
 
 // ---- CUDA error checking ----
 #define CUDA_CHECK(call)                                                       \
@@ -31,7 +44,7 @@
 #define CUDA_CHECK_KERNEL()                                                    \
     do {                                                                       \
         CUDA_CHECK(cudaGetLastError());                                        \
-        CUDA_CHECK(cudaDeviceSynchronize());                                   \
+        if (step_syncs) CUDA_CHECK(cudaDeviceSynchronize());                   \
     } while (0)
 
 
@@ -43,9 +56,26 @@
 #define PROF_POP()      nvtxRangePop()
 #define PROF_POP_SYNC()                                                        \
     do {                                                                       \
-        CUDA_CHECK(cudaDeviceSynchronize());                                   \
+        if (step_syncs) CUDA_CHECK(cudaDeviceSynchronize());                   \
         nvtxRangePop();                                                        \
     } while (0)
+
+
+// ---- stream fork/join ----
+// The solver runs on the default stream. Where two parts of an iteration are
+// independent (sTt and tTt, the x and r updates) one of them goes on a side
+// stream instead. fork_to makes the side stream wait for everything queued on
+// the default stream so far; join_from makes the default stream wait for
+// everything queued on the side stream, so later work sees both results.
+static void fork_to(cudaStream_t side, cudaEvent_t ev){
+    CUDA_CHECK(cudaEventRecord(ev, 0));
+    CUDA_CHECK(cudaStreamWaitEvent(side, ev, 0));
+}
+
+static void join_from(cudaStream_t side, cudaEvent_t ev){
+    CUDA_CHECK(cudaEventRecord(ev, side));
+    CUDA_CHECK(cudaStreamWaitEvent(0, ev, 0));
+}
 
 
 /*
@@ -64,6 +94,9 @@ XXXX000
 
 
 #define ERROR_RATE 1e-8
+
+// Iteration count of the solve loop unless an argument overrides it.
+#define DEFAULT_ITERATIONS 50
 
 struct multiply
 {
@@ -195,6 +228,20 @@ void mult(double* x, double* y, double* z){
     *x = *y * *z;
 }
 
+// Write the solution one entry per line at full double precision, so the
+// different implementations' results can be compared entry by entry.
+static void write_x(const char* path, const double* x, int n){
+    FILE* f = fopen(path, "w");
+    if (!f){
+        fprintf(stderr, "could not open %s for writing\n", path);
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n; i++){
+        fprintf(f, "%.17g\n", x[i]);
+    }
+    fclose(f);
+}
+
 int main(int argc, char** argv){
 
     // Problem size: optional first argument, defaults to 100.
@@ -208,9 +255,28 @@ int main(int argc, char** argv){
         return 1;
     }
 
+    // RNG seed: optional second argument, defaults to the current time. Give
+    // every implementation the same seed and they solve the same system.
+    unsigned int seed = time(NULL);
+    if (argc > 2){
+        seed = strtoul(argv[2], nullptr, 10);
+    }
+    std::cout << "seed: " << seed << std::endl;
+
+    // Iterations: optional third argument, defaults to DEFAULT_ITERATIONS.
+    // There is no convergence test, so this is exactly how many run.
+    int iterations = DEFAULT_ITERATIONS;
+    if (argc > 3){
+        iterations = atoi(argv[3]);
+    }
+    if (iterations < 1){
+        std::cerr << "iterations must be >= 1; got " << iterations << std::endl;
+        return 1;
+    }
+
     PROF_PUSH("setup:host_init");
     // Initial values on host to simulate real world environment
-    thrust::default_random_engine rng(time(NULL));
+    thrust::default_random_engine rng(seed);
     thrust::uniform_real_distribution<double> dist(-1.0, 1.0);
 
     thrust::host_vector<double> h_A(n*7);
@@ -351,14 +417,36 @@ int main(int argc, char** argv){
     ));
 
     CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_bytes));
+
+    // The side stream reduces at the same time as the default stream, so it
+    // needs its own scratch; sharing one would let the two clobber each other.
+    void* d_temp_storage_side = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_temp_storage_side, temp_bytes));
     PROF_POP_SYNC(); // setup:cub_temp_alloc
+
+    // Non-blocking: a plain stream would implicitly sync with the legacy
+    // default stream and serialise the two branches again.
+    PROF_PUSH("setup:streams");
+    cudaStream_t side;
+    cudaEvent_t ev_fork, ev_join;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
+    PROF_POP(); // setup:streams
 
     // loop
     PROF_PUSH("init:residual_norm");
     std::cout << thrust::inner_product(thrust::device, r.begin(), r.end(), r.begin(), 0.0) << std::endl;
     PROF_POP_SYNC(); // init:residual_norm
+    // Drain the GPU, then time the loop with a host clock. The loop's end
+    // is synced explicitly as well, so this times the GPU work of the
+    // iterations whether or not the per-step syncs are on.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    step_syncs = PROFILE_SYNC;
+    printf("step_syncs: %s\n", step_syncs ? "on" : "off");
+    auto solve_start = std::chrono::steady_clock::now();
     PROF_PUSH("solve:loop");
-    for (int i = 0; i < 50; i++){
+    for (int i = 0; i < iterations; i++){
         PROF_PUSH("iter");
         // rho_p = rho;
         // rho = thrust::inner_product(thrust::device, r.begin(), r.end(), r_hat.begin(), 0.0); 
@@ -460,20 +548,24 @@ int main(int argc, char** argv){
         // double st = thrust::inner_product(thrust::device, s.begin(), s.end(), t.begin(), 0.0);
         // double tt = thrust::inner_product(thrust::device, t.begin(), t.end(), t.begin(), 0.0);
 
-        // sTt
+        // sTt and tTt only read s and t, so they reduce concurrently
         PROF_PUSH("step:omega");
+        fork_to(side, ev_fork);
+
+        // sTt (side stream)
         CUDA_CHECK(cub::DeviceReduce::TransformReduce(
-            d_temp_storage,
+            d_temp_storage_side,
             temp_bytes,
             first,
             sTt,
             s.size(),
             cuda::std::plus<double>{},
             multiply{ptr_s, ptr_t},
-            0.0
+            0.0,
+            side
         ));
 
-        // tTt
+        // tTt (default stream)
         CUDA_CHECK(cub::DeviceReduce::TransformReduce(
             d_temp_storage,
             temp_bytes,
@@ -484,7 +576,9 @@ int main(int argc, char** argv){
             multiply{ptr_t, ptr_t},
             0.0
         ));
-        
+
+        join_from(side, ev_join);
+
         // omega
         div<<<1, 1>>>(d_omega, sTt, tTt);
         CUDA_CHECK_KERNEL();
@@ -493,25 +587,31 @@ int main(int argc, char** argv){
         // thrust::transform(thrust::device, first, last, x.begin(), x_calc);
         // thrust::transform(thrust::device, first, last, r.begin(), r_calc_update);
         
-        // update x
-        PROF_PUSH("step:x");
+        // x and r both only need omega and write different vectors, so they
+        // update concurrently - one range, since a sync between them would
+        // serialise them again
+        PROF_PUSH("step:x + r");
+        fork_to(side, ev_fork);
+
+        // update x (side stream)
         CUDA_CHECK(cub::DeviceTransform::Transform(
             first,
             x.begin(),
             x.size(),
-            x_calc{ptr_x, ptr_p, ptr_s, d_alpha, d_omega}
+            x_calc{ptr_x, ptr_p, ptr_s, d_alpha, d_omega},
+            side
         ));
-        PROF_POP_SYNC(); // step:x
 
-        // update r
-        PROF_PUSH("step:r");
+        // update r (default stream)
         CUDA_CHECK(cub::DeviceTransform::Transform(
             first,
             r.begin(),
             r.size(),
             r_calc_update{ptr_s, ptr_t, d_omega}
         ));
-        PROF_POP_SYNC(); // step:r
+
+        join_from(side, ev_join);
+        PROF_POP_SYNC(); // step:x + r
 
 
         // std::cout << "rho: " << rho << std::endl;
@@ -524,10 +624,20 @@ int main(int argc, char** argv){
 
         PROF_POP_SYNC(); // iter
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    step_syncs = true;
     PROF_POP(); // solve:loop
+    double solve_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - solve_start).count();
+    printf("iterations: %d\nsolve_ms: %.3f\n", iterations, solve_ms);
     PROF_PUSH("final:residual_norm");
     std::cout << "residual: " << thrust::inner_product(thrust::device, r.begin(), r.end(), r.begin(), 0.0) << std::endl;
     PROF_POP_SYNC(); // final:residual_norm
+
+    PROF_PUSH("final:write_x");
+    thrust::host_vector<double> h_x_out = x;
+    write_x("x_cub.txt", thrust::raw_pointer_cast(h_x_out.data()), n);
+    PROF_POP(); // final:write_x
 
     // The device_vectors (A, b, x, r, r_hat, v, p, s, t) release themselves
     // when they go out of scope; the raw cudaMalloc'd scalars do not.
@@ -545,7 +655,12 @@ int main(int argc, char** argv){
     CUDA_CHECK(cudaFree(tTt));
 
     CUDA_CHECK(cudaFree(d_temp_storage));
+    CUDA_CHECK(cudaFree(d_temp_storage_side));
     PROF_POP_SYNC(); // teardown:device_free
+
+    CUDA_CHECK(cudaEventDestroy(ev_fork));
+    CUDA_CHECK(cudaEventDestroy(ev_join));
+    CUDA_CHECK(cudaStreamDestroy(side));
 
     return 0;
 }

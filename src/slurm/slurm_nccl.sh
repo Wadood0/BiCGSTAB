@@ -11,6 +11,8 @@
 #SBATCH --partition=gpu          # CHANGE: your cluster's GPU partition
 ##SBATCH --account=your_account  # CHANGE + uncomment if your cluster needs one
 
+# Submit from src/ (the job runs in the submit directory):  sbatch slurm/slurm_nccl.sh
+
 set -euo pipefail
 
 module purge
@@ -19,7 +21,7 @@ module load nccl                 # CHANGE: e.g. nccl/2.27 - `module avail nccl` 
 
 cd "$SLURM_SUBMIT_DIR"
 
-# Problem size; override at submit time with:  sbatch --export=ALL,N=1000000 slurm_nccl.sh
+# Problem size; override at submit time with:  sbatch --export=ALL,N=1000000 slurm/slurm_nccl.sh
 N=${N:-100}
 # Use every GPU slurm gave us.
 NGPUS=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}

@@ -11,6 +11,8 @@
 #SBATCH --partition=gpu          # CHANGE: your cluster's GPU partition
 ##SBATCH --account=your_account  # CHANGE + uncomment if your cluster needs one
 
+# Submit from src/ (the job runs in the submit directory):  sbatch slurm/slurm_cub.sh
+
 set -euo pipefail
 
 module purge

@@ -5,6 +5,7 @@
 #include <thrust/random.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <chrono>
 #include <nvtx3/nvToolsExt.h>
 #include <iostream>
 #include <vector>
@@ -12,6 +13,18 @@
 #include <cub/cub.cuh>
 #include <cuda/std/functional>
 #include <nccl.h>
+
+// ---- per-step syncs ----
+// Inside the solve loop every profiling range waits for the GPU, so
+// the NVTX step ranges time the GPU work - at the cost of a host round trip
+// per step. Build with -DPROFILE_SYNC=0 (make PROFILE_SYNC=0, or the *_nosync
+// targets) to drop those syncs inside the loop: the step ranges then time
+// only the launches. Setup and teardown always sync, and the loop
+// timer syncs at both ends itself.
+#ifndef PROFILE_SYNC
+#define PROFILE_SYNC 1
+#endif
+static bool step_syncs = true;
 
 // ---- CUDA error checking ----
 #define CUDA_CHECK(call)                                                       \
@@ -59,7 +72,7 @@
 #define PROF_POP()      nvtxRangePop()
 #define PROF_POP_SYNC(gpus)                                                    \
     do {                                                                       \
-        SYNC_ALL(gpus);                                                        \
+        if (step_syncs) SYNC_ALL(gpus);                                        \
         nvtxRangePop();                                                        \
     } while (0)
 
@@ -94,6 +107,9 @@ GPU HOLDS ITS OWN COPY OF rho, alpha, omega, beta AND COMPUTES THEM ITSELF.
 
 
 #define ERROR_RATE 1e-8
+
+// Iteration count of the solve loop unless an argument overrides it.
+#define DEFAULT_ITERATIONS 50
 
 // Halo width: the matrix reaches 3 columns either side of the diagonal.
 #define HALO 3
@@ -235,8 +251,22 @@ void mult(double* x, double* y, double* z){
     *x = *y * *z;
 }
 
+// Write the solution one entry per line at full double precision, so the
+// different implementations' results can be compared entry by entry.
+static void write_x(const char* path, const double* x, int n){
+    FILE* f = fopen(path, "w");
+    if (!f){
+        fprintf(stderr, "could not open %s for writing\n", path);
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n; i++){
+        fprintf(f, "%.17g\n", x[i]);
+    }
+    fclose(f);
+}
+
 // Everything one GPU owns: rows [row0, row0 + n_local) of the system, its
-// stream and its NCCL communicator. x, p and s are halo buffers of
+// streams and its NCCL communicator. x, p and s are halo buffers of
 // n_local + 2*HALO entries; everything else is n_local long.
 struct Shard {
     int dev;
@@ -244,6 +274,13 @@ struct Shard {
     int n_local;
     cudaStream_t stream;
     ncclComm_t comm;
+
+    // Second stream for the independent half of a step (sTt vs tTt, x vs r).
+    // NCCL only ever runs on `stream`; side work is always joined back into
+    // it before the step ends, so SYNC_ALL on `stream` covers both.
+    cudaStream_t side;
+    cudaEvent_t ev_fork;
+    cudaEvent_t ev_join;
 
     // matrix/vectors
     double* A;
@@ -271,10 +308,24 @@ struct Shard {
     double* tTt;
     double* rTr;
 
-    // CUB scratch
+    // CUB scratch - the side stream reduces concurrently, so it gets its own
     void* d_temp_storage;
+    void* d_temp_storage_side;
     size_t temp_bytes;
 };
+
+// Fork: the side stream waits for everything queued on the main stream so far.
+// Join: the main stream waits for everything queued on the side stream.
+// Both expect g.dev to be the current device.
+static void fork_side(Shard& g){
+    CUDA_CHECK(cudaEventRecord(g.ev_fork, g.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(g.side, g.ev_fork, 0));
+}
+
+static void join_side(Shard& g){
+    CUDA_CHECK(cudaEventRecord(g.ev_join, g.side));
+    CUDA_CHECK(cudaStreamWaitEvent(g.stream, g.ev_join, 0));
+}
 
 // Sum per-GPU partial dot products in place, so every GPU ends up with the
 // global value. Several scalars in one call share a single NCCL group launch.
@@ -376,9 +427,28 @@ int main(int argc, char** argv){
         return 1;
     }
 
+    // RNG seed: optional third argument, defaults to the current time. Give
+    // every implementation the same seed and they solve the same system.
+    unsigned int seed = time(NULL);
+    if (argc > 3){
+        seed = strtoul(argv[3], nullptr, 10);
+    }
+    std::cout << "seed: " << seed << std::endl;
+
+    // Iterations: optional fourth argument, defaults to DEFAULT_ITERATIONS.
+    // There is no convergence test, so this is exactly how many run.
+    int iterations = DEFAULT_ITERATIONS;
+    if (argc > 4){
+        iterations = atoi(argv[4]);
+    }
+    if (iterations < 1){
+        std::cerr << "iterations must be >= 1; got " << iterations << std::endl;
+        return 1;
+    }
+
     PROF_PUSH("setup:host_init");
     // Initial values on host to simulate real world environment
-    thrust::default_random_engine rng(time(NULL));
+    thrust::default_random_engine rng(seed);
     thrust::uniform_real_distribution<double> dist(-1.0, 1.0);
 
     thrust::host_vector<double> h_A(n*7);
@@ -413,8 +483,10 @@ int main(int argc, char** argv){
 
     PROF_POP(); // setup:host_init
 
-    // One stream per GPU; CUB, the scalar kernels and NCCL all run on it, so
-    // work on a GPU is ordered without any host synchronisation.
+    // One main stream per GPU; CUB, the scalar kernels and NCCL all run on it,
+    // so work on a GPU is ordered without any host synchronisation. A side
+    // stream per GPU picks up the independent half of a step, ordered against
+    // the main stream with events.
     PROF_PUSH("setup:nccl_init");
     std::vector<int> devs(ngpus);
     std::vector<ncclComm_t> comms(ngpus);
@@ -422,6 +494,9 @@ int main(int argc, char** argv){
         devs[k] = gpus[k].dev;
         CUDA_CHECK(cudaSetDevice(gpus[k].dev));
         CUDA_CHECK(cudaStreamCreate(&gpus[k].stream));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&gpus[k].side, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&gpus[k].ev_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&gpus[k].ev_join, cudaEventDisableTiming));
     }
     // rank k <-> devs[k], which halo_exchange relies on
     NCCL_CHECK(ncclCommInitAll(comms.data(), ngpus, devs.data()));
@@ -566,6 +641,7 @@ int main(int argc, char** argv){
         ));
 
         CUDA_CHECK(cudaMalloc(&g.d_temp_storage, g.temp_bytes));
+        CUDA_CHECK(cudaMalloc(&g.d_temp_storage_side, g.temp_bytes));
     }
     PROF_POP_SYNC(gpus); // setup:cub_temp_alloc
 
@@ -573,8 +649,15 @@ int main(int argc, char** argv){
     PROF_PUSH("init:residual_norm");
     std::cout << residual_norm(gpus) << std::endl;
     PROF_POP_SYNC(gpus); // init:residual_norm
+    // Drain the GPU, then time the loop with a host clock. The loop's end
+    // is synced explicitly as well, so this times the GPU work of the
+    // iterations whether or not the per-step syncs are on.
+    SYNC_ALL(gpus);
+    step_syncs = PROFILE_SYNC;
+    printf("step_syncs: %s\n", step_syncs ? "on" : "off");
+    auto solve_start = std::chrono::steady_clock::now();
     PROF_PUSH("solve:loop");
-    for (int i = 0; i < 50; i++){
+    for (int i = 0; i < iterations; i++){
         PROF_PUSH("iter");
         // rho_p = rho;
         // rho = r.r_hat summed over every GPU
@@ -706,13 +789,16 @@ int main(int argc, char** argv){
         }
         PROF_POP_SYNC(gpus); // step:t = A*s
 
-        // sTt, tTt - both partials go out in a single allreduce group
+        // sTt, tTt - they only read s and t, so on each GPU the two partials
+        // reduce concurrently; both then go out in a single allreduce group
         PROF_PUSH("step:omega");
         for (auto& g : gpus){
             CUDA_CHECK(cudaSetDevice(g.dev));
-            // sTt
+            fork_side(g);
+
+            // sTt (side stream)
             CUDA_CHECK(cub::DeviceReduce::TransformReduce(
-                g.d_temp_storage,
+                g.d_temp_storage_side,
                 g.temp_bytes,
                 first,
                 g.sTt,
@@ -720,10 +806,10 @@ int main(int argc, char** argv){
                 cuda::std::plus<double>{},
                 multiply{g.s + HALO, g.t},
                 0.0,
-                g.stream
+                g.side
             ));
 
-            // tTt
+            // tTt (main stream)
             CUDA_CHECK(cub::DeviceReduce::TransformReduce(
                 g.d_temp_storage,
                 g.temp_bytes,
@@ -735,6 +821,9 @@ int main(int argc, char** argv){
                 0.0,
                 g.stream
             ));
+
+            // the allreduce runs on the main stream and needs sTt too
+            join_side(g);
         }
         allreduce_sum(gpus, {&Shard::sTt, &Shard::tTt});
 
@@ -746,24 +835,24 @@ int main(int argc, char** argv){
         }
         PROF_POP_SYNC(gpus); // step:omega
 
-        // update x
-        PROF_PUSH("step:x");
+        // x and r both only need omega and write different vectors, so they
+        // update concurrently - one range, since a sync between them would
+        // serialise them again
+        PROF_PUSH("step:x + r");
         for (auto& g : gpus){
             CUDA_CHECK(cudaSetDevice(g.dev));
+            fork_side(g);
+
+            // update x (side stream)
             CUDA_CHECK(cub::DeviceTransform::Transform(
                 first,
                 g.x + HALO,
                 g.n_local,
                 x_calc{g.x + HALO, g.p + HALO, g.s + HALO, g.d_alpha, g.d_omega},
-                g.stream
+                g.side
             ));
-        }
-        PROF_POP_SYNC(gpus); // step:x
 
-        // update r
-        PROF_PUSH("step:r");
-        for (auto& g : gpus){
-            CUDA_CHECK(cudaSetDevice(g.dev));
+            // update r (main stream)
             CUDA_CHECK(cub::DeviceTransform::Transform(
                 first,
                 g.r,
@@ -771,15 +860,33 @@ int main(int argc, char** argv){
                 r_calc_update{g.s + HALO, g.t, g.d_omega},
                 g.stream
             ));
+
+            join_side(g);
         }
-        PROF_POP_SYNC(gpus); // step:r
+        PROF_POP_SYNC(gpus); // step:x + r
 
         PROF_POP_SYNC(gpus); // iter
     }
+    SYNC_ALL(gpus);
+    step_syncs = true;
     PROF_POP(); // solve:loop
+    double solve_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - solve_start).count();
+    printf("iterations: %d\nsolve_ms: %.3f\n", iterations, solve_ms);
     PROF_PUSH("final:residual_norm");
     std::cout << "residual: " << residual_norm(gpus) << std::endl;
     PROF_POP_SYNC(gpus); // final:residual_norm
+
+    // Gather every GPU's rows of x back into one host vector (h_x held x0,
+    // which is no longer needed) and write it out.
+    PROF_PUSH("final:write_x");
+    for (auto& g : gpus){
+        CUDA_CHECK(cudaSetDevice(g.dev));
+        CUDA_CHECK(cudaMemcpy(thrust::raw_pointer_cast(h_x.data()) + g.row0, g.x + HALO,
+                              g.n_local * sizeof(double), cudaMemcpyDeviceToHost));
+    }
+    write_x("x_nccl.txt", thrust::raw_pointer_cast(h_x.data()), n);
+    PROF_POP(); // final:write_x
 
     // Nothing here frees itself: every buffer is a raw cudaMalloc on a
     // specific device, so free each GPU's with that GPU current.
@@ -810,6 +917,7 @@ int main(int argc, char** argv){
         CUDA_CHECK(cudaFree(g.rTr));
 
         CUDA_CHECK(cudaFree(g.d_temp_storage));
+        CUDA_CHECK(cudaFree(g.d_temp_storage_side));
     }
     PROF_POP_SYNC(gpus); // teardown:device_free
 
@@ -818,6 +926,9 @@ int main(int argc, char** argv){
     for (auto& g : gpus){
         CUDA_CHECK(cudaSetDevice(g.dev));
         NCCL_CHECK(ncclCommDestroy(g.comm));
+        CUDA_CHECK(cudaEventDestroy(g.ev_fork));
+        CUDA_CHECK(cudaEventDestroy(g.ev_join));
+        CUDA_CHECK(cudaStreamDestroy(g.side));
         CUDA_CHECK(cudaStreamDestroy(g.stream));
     }
     PROF_POP(); // teardown:nccl_destroy

@@ -12,6 +12,13 @@ ARCH      ?= native
 
 NVCCFLAGS := -std=c++17 --extended-lambda -O3 -lineinfo -arch=$(ARCH)
 
+# A toolkit whose bundled CUB predates cub::DeviceTransform can use a newer,
+# header-only CCCL checkout instead:  make CCCL_HOME=/path/to/cccl
+CCCL_HOME ?=
+ifneq ($(CCCL_HOME),)
+NVCCFLAGS += -I$(CCCL_HOME)/thrust -I$(CCCL_HOME)/cub -I$(CCCL_HOME)/libcudacxx/include
+endif
+
 # NCCL (main_nccl only). The libnccl2/libnccl-dev packages install to the
 # default paths, so leave this empty there. Cluster nccl modules usually export
 # NCCL_HOME themselves; otherwise pass it:  make NCCL_HOME=/path/to/nccl
@@ -19,6 +26,12 @@ NCCL_HOME ?=
 ifneq ($(NCCL_HOME),)
 NCCLFLAGS := -I$(NCCL_HOME)/include -L$(NCCL_HOME)/lib -Xlinker -rpath=$(NCCL_HOME)/lib
 endif
+
+# Per-step syncs inside the solve loop (they make the NVTX step ranges time
+# GPU work). 0 drops them:  make PROFILE_SYNC=0. The *_nosync targets build
+# that variant next to the normal binaries, e.g. make main_cub_nosync.
+PROFILE_SYNC ?= 1
+NVCCFLAGS += -DPROFILE_SYNC=$(PROFILE_SYNC)
 
 TARGETS := main_cub main_thrust main_nccl
 
@@ -29,6 +42,12 @@ all: $(TARGETS)
 
 main_nccl: main_nccl.cu
 	$(NVCC) $(NVCCFLAGS) $(NCCLFLAGS) $< -o $@ -lnccl
+
+%_nosync: %.cu
+	$(NVCC) $(filter-out -DPROFILE_SYNC=%,$(NVCCFLAGS)) -DPROFILE_SYNC=0 $< -o $@
+
+main_nccl_nosync: main_nccl.cu
+	$(NVCC) $(filter-out -DPROFILE_SYNC=%,$(NVCCFLAGS)) $(NCCLFLAGS) -DPROFILE_SYNC=0 $< -o $@ -lnccl
 
 run: $(TARGETS)
 	./main_cub
@@ -67,7 +86,36 @@ check: $(TARGETS)
 	$(CUDA_HOME)/bin/compute-sanitizer --tool memcheck ./main_thrust
 	$(CUDA_HOME)/bin/compute-sanitizer --tool memcheck ./main_nccl
 
-clean:
-	rm -f $(TARGETS) report_*.nsys-rep report_*.sqlite
+# ---- correctness: every implementation must converge to the same x ----
+# All runs get the same N and seed, so they solve the same system. Each one
+# writes x_<impl>.txt, and every entry is compared against main_cub's: the
+# difference must be within TOL, relative to the entry (absolute below 1).
+# Reduction order differs between implementations (and GPU counts), so the
+# results agree to rounding, not bit for bit.
+# No NCCL on this machine?  make verify VERIFY_IMPLS=thrust
+N            ?= 100
+SEED         ?= 12345
+NGPUS        ?= $(shell nvidia-smi -L | wc -l)
+TOL          ?= 1e-8
+VERIFY_IMPLS ?= thrust nccl
 
-.PHONY: all run check clean profile profile-cub profile-thrust profile-nccl compare
+verify: main_cub $(addprefix main_,$(VERIFY_IMPLS))
+	./main_cub $(N) $(SEED) > /dev/null
+	@set -e; for impl in $(VERIFY_IMPLS); do \
+	    if [ $$impl = nccl ]; then ./main_nccl $(N) $(NGPUS) $(SEED) > /dev/null; \
+	    else ./main_$$impl $(N) $(SEED) > /dev/null; fi; \
+	    paste x_cub.txt x_$$impl.txt | awk -v tol=$(TOL) -v impl=$$impl ' \
+	        NF != 2 || $$0 ~ /nan|inf/ { bad = 1; next } \
+	        { d = $$1 - $$2; if (d < 0) d = -d; \
+	          m = $$1 < 0 ? -$$1 : $$1; if (m < 1) m = 1; \
+	          if (d / m > worst) worst = d / m } \
+	        END { ok = !bad && worst <= tol; \
+	              printf "cub vs %-6s max diff %.3g  %s\n", impl, worst, \
+	                     bad ? "FAIL (length mismatch or nan/inf)" : ok ? "ok" : "FAIL"; \
+	              exit !ok }'; \
+	done
+
+clean:
+	rm -f $(TARGETS) $(TARGETS:=_nosync) report_*.nsys-rep report_*.sqlite x_*.txt
+
+.PHONY: all run check clean profile profile-cub profile-thrust profile-nccl compare verify
